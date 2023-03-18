@@ -36,6 +36,7 @@ type Response = Request;
 #[derive(Debug, Clone)]
 struct RpcClient {
     requests: Arc<Mutex<Vec<Request>>>,
+    responses: Arc<Mutex<Vec<Response>>>,
     socket: Arc<UdpSocket>,
     notify: Arc<Notify>,
     exit: Arc<AtomicBool>,
@@ -57,6 +58,7 @@ impl RpcClient {
         let (tx, _) = broadcast::channel(1);
         Ok(Self {
             requests: Arc::new(Mutex::new(Vec::new())),
+            responses: Arc::new(Mutex::new(Vec::new())),
             socket,
             notify: Arc::new(Notify::new()),
             exit: Arc::new(AtomicBool::new(false)),
@@ -69,6 +71,7 @@ impl RpcClient {
         let notify = Arc::clone(&self.notify);
         let socket = Arc::clone(&self.socket);
         let requests = Arc::clone(&self.requests);
+        let responses = Arc::clone(&self.responses);
         let exit = Arc::clone(&self.exit);
         let mut rx = self.tx.as_ref().unwrap().subscribe();
 
@@ -89,7 +92,8 @@ impl RpcClient {
                             if let Some(index) = requests.iter().position(|r| r.id == response.id) {
                                 // Remove the request from the list
                                 let request = requests.remove(index);
-                                // Process the response here
+                                let mut responses = responses.lock().await;
+                                responses.push(response);
                                 println!("Received response for request {:?}", request);
                                 notify.notify_waiters();
                             }
@@ -157,6 +161,39 @@ impl RpcClient {
         Ok(())
     }
 
+    async fn response_handler_task_func(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let notify = Arc::clone(&self.notify);
+        let responses = Arc::clone(&self.responses);
+        let exit = Arc::clone(&self.exit);
+        let mut rx = self.tx.as_ref().unwrap().subscribe();
+
+        loop {
+            tokio::select! {
+                _ = rx.recv() => {
+                    println!("Response handler task got signal");
+                    if exit.load(std::sync::atomic::Ordering::Relaxed) {
+                        println!("Response handler task exiting");
+                        break;
+                    }
+                }
+                _ = notify.notified() => {
+                    loop {
+                        let mut responses = responses.lock().await;
+                        if responses.len() == 0 {
+                            println!("Response task, no pending response to handle");
+                            break;
+                        }
+                        let response = responses.remove(0);
+                        println!("Response handler is handling response {:?}", response);
+                        // TODO: map callback function with request ID, and call the callback here
+                   }
+                }
+            }
+        }
+        Ok(())
+    }
+
+
     async fn post_request(&self, request: Request) -> Result<(), Box<dyn std::error::Error>> {
         let requests = Arc::clone(&self.requests);
         let mut requests = requests.lock().await;
@@ -190,6 +227,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sender.send_task_func().await.unwrap();
     });
 
+    let response_handler = rpc_client.clone();
+    let response_handler_task = tokio::spawn(async move {
+        response_handler.response_handler_task_func().await.unwrap();
+    });
+
     for i in 0..10 {
         rpc_client
             .post_request(Request {
@@ -207,6 +249,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     rpc_client.stop();
     receive_task.await.unwrap();
     resend_task.await.unwrap();
+    response_handler_task.await.unwrap();
 
     Ok(())
 }
