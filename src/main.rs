@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -40,6 +40,7 @@ struct RpcClient {
     socket: Arc<UdpSocket>,
     notify: Arc<Notify>,
     exit: Arc<AtomicBool>,
+    started: Arc<AtomicUsize>,
     tx: Option<broadcast::Sender<()>>,
 }
 
@@ -62,6 +63,7 @@ impl RpcClient {
             socket,
             notify: Arc::new(Notify::new()),
             exit: Arc::new(AtomicBool::new(false)),
+            started: Arc::new(AtomicUsize::new(0)),
             tx: Some(tx),
         })
     }
@@ -73,7 +75,9 @@ impl RpcClient {
         let requests = Arc::clone(&self.requests);
         let responses = Arc::clone(&self.responses);
         let exit = Arc::clone(&self.exit);
+        let started = Arc::clone(&self.started);
         let mut rx = self.tx.as_ref().unwrap().subscribe();
+        started.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         loop {
             tokio::select! {
@@ -110,6 +114,7 @@ impl RpcClient {
                 }
             }
         }
+        started.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -118,7 +123,9 @@ impl RpcClient {
         let socket = Arc::clone(&self.socket);
         let requests = Arc::clone(&self.requests);
         let exit = Arc::clone(&self.exit);
+        let started = Arc::clone(&self.started);
         let mut rx = self.tx.as_ref().unwrap().subscribe();
+        started.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         loop {
             tokio::select! {
@@ -158,6 +165,7 @@ impl RpcClient {
                 }
             }
         }
+        started.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -194,13 +202,26 @@ impl RpcClient {
     }
 
 
-    async fn post_request(&self, request: Request) -> Result<(), Box<dyn std::error::Error>> {
+    async fn post_request(&self, request: Request, timeout_ms: u64) -> Result<Box<Vec<u8>>, Box<dyn std::error::Error>> {
         let requests = Arc::clone(&self.requests);
+        let notify = Arc::clone(&self.notify);
         let mut requests = requests.lock().await;
         println!("Posting request {:?}", request);
         requests.push(request);
-        self.notify.clone().notify_waiters();
-        Ok(())
+        notify.notify_waiters();
+
+        // Wait for response with timeout
+        let response = Box::new(vec![1, 2, 3]);
+        match timeout(Duration::from_millis(timeout_ms), notify.notified()).await {
+            Ok(_) => {
+                println!("Sender task got notification");
+            },
+            Err(_) => {
+                println!("Sender task timed out waiting for notification, try resend request");
+            },
+        }
+
+        Ok(response)
     }
 
     fn stop(&self) {
@@ -208,6 +229,14 @@ impl RpcClient {
         if let Some(tx) = &self.tx {
             let _ = tx.send(());
         }
+    }
+
+    async fn wait_for_tasks_start(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let started = Arc::clone(&self.started);
+        while 2 != started.load(std::sync::atomic::Ordering::Relaxed) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        Ok(())
     }
 }
 
@@ -227,79 +256,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sender.send_task_func().await.unwrap();
     });
 
-    let response_handler = rpc_client.clone();
-    let response_handler_task = tokio::spawn(async move {
-        response_handler.response_handler_task_func().await.unwrap();
-    });
+    rpc_client.wait_for_tasks_start().await?;
 
-    for i in 0..10 {
+    // Try issue multiple requests concurrently
+    let responses = tokio::join! {
         rpc_client
             .post_request(Request {
-                id: i,
-                payload: "Hello, world!".to_owned(),
+                id: 1234,
+                payload: format!("hello, world! {}", 1234).to_owned(),
                 sent_at: instant_to_u64(Instant::now()),
                 retries: 5,
-            })
-            .await
-            .unwrap();
-    }
+            }, 1000),
+        rpc_client
+            .post_request(Request {
+                id: 5678,
+                payload: format!("hello, world! {}", 5678).to_owned(),
+                sent_at: instant_to_u64(Instant::now()),
+                retries: 5,
+            }, 1000),
+    };
+    println!("Final responses: {:?}", responses);
 
     // Sleep some time for the communication to finish
     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
     rpc_client.stop();
     receive_task.await.unwrap();
     resend_task.await.unwrap();
-    response_handler_task.await.unwrap();
 
     Ok(())
 }
 
 // Test this with local echo server running as:
 // ~$ ncat -l 8081 --keep-open --udp --exec "/bin/cat"
-// $ cargo run
-//      Running `target/debug/playground`
-// Posting request Request { id: 0, payload: "Hello, world!", sent_at: 0, retries: 5 }
-// Posting request Request { id: 1, payload: "Hello, world!", sent_at: 0, retries: 5 }
-// Posting request Request { id: 2, payload: "Hello, world!", sent_at: 0, retries: 5 }
-// Posting request Request { id: 3, payload: "Hello, world!", sent_at: 0, retries: 5 }
-// Posting request Request { id: 4, payload: "Hello, world!", sent_at: 0, retries: 5 }
-// Posting request Request { id: 5, payload: "Hello, world!", sent_at: 0, retries: 5 }
-// Posting request Request { id: 6, payload: "Hello, world!", sent_at: 0, retries: 5 }
-// Posting request Request { id: 7, payload: "Hello, world!", sent_at: 0, retries: 5 }
-// Posting request Request { id: 8, payload: "Hello, world!", sent_at: 0, retries: 5 }
-// Sender task is posting request Request { id: 0, payload: "Hello, world!", sent_at: 0, retries: 5 }
-// Posting request Request { id: 9, payload: "Hello, world!", sent_at: 0, retries: 5 }
-// Sender task got notification
-// Received response for request Request { id: 0, payload: "Hello, world!", sent_at: 0, retries: 4 }
-// Sender task is posting request Request { id: 1, payload: "Hello, world!", sent_at: 0, retries: 5 }
-// Received response for request Request { id: 1, payload: "Hello, world!", sent_at: 0, retries: 4 }
-// Sender task got notification
-// Sender task is posting request Request { id: 2, payload: "Hello, world!", sent_at: 0, retries: 5 }
-// Received response for request Request { id: 2, payload: "Hello, world!", sent_at: 0, retries: 4 }
-// Sender task got notification
-// Sender task is posting request Request { id: 3, payload: "Hello, world!", sent_at: 0, retries: 5 }
-// Received response for request Request { id: 3, payload: "Hello, world!", sent_at: 0, retries: 4 }
-// Sender task got notification
-// Sender task is posting request Request { id: 4, payload: "Hello, world!", sent_at: 0, retries: 5 }
-// Received response for request Request { id: 4, payload: "Hello, world!", sent_at: 0, retries: 4 }
-// Sender task got notification
-// Sender task is posting request Request { id: 5, payload: "Hello, world!", sent_at: 0, retries: 5 }
-// Received response for request Request { id: 5, payload: "Hello, world!", sent_at: 0, retries: 4 }
-// Sender task got notification
-// Sender task is posting request Request { id: 6, payload: "Hello, world!", sent_at: 0, retries: 5 }
-// Received response for request Request { id: 6, payload: "Hello, world!", sent_at: 0, retries: 4 }
-// Sender task got notification
-// Sender task is posting request Request { id: 7, payload: "Hello, world!", sent_at: 0, retries: 5 }
-// Received response for request Request { id: 7, payload: "Hello, world!", sent_at: 0, retries: 4 }
-// Sender task got notification
-// Sender task is posting request Request { id: 8, payload: "Hello, world!", sent_at: 0, retries: 5 }
-// Received response for request Request { id: 8, payload: "Hello, world!", sent_at: 0, retries: 4 }
-// Sender task got notification
-// Sender task is posting request Request { id: 9, payload: "Hello, world!", sent_at: 0, retries: 5 }
-// Received response for request Request { id: 9, payload: "Hello, world!", sent_at: 0, retries: 4 }
-// Sender task got notification
-// Sender task, no pending request to send
-// Receiver task got signal
-// Receiver task exiting
-// Sender task got signal
-// Sender task exiting
