@@ -21,7 +21,7 @@ pub fn write_message() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 }
 
 pub fn read_message(serialized_message: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    // Cursor implements the Read trait,  allow you to read data from a buffer as if from a file or other input stream.
+    // Cursor implements the Read trait,  allow you read data from a buffer as if from a file or other input stream.
     let mut cursor = Cursor::new(serialized_message);
     let message_reader = serialize_packed::read_message(&mut cursor, Default::default())?;
 
