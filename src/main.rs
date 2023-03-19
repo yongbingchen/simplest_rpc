@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::sync::Notify;
 use tokio::time::timeout;
 // std::sync::Mutex is not Send, so not able to use in tokio
@@ -36,6 +36,7 @@ type Response = Request;
 #[derive(Debug, Clone)]
 struct RpcClient {
     requests: Arc<Mutex<Vec<Request>>>,
+    req: Arc<Mutex<mpsc::Receiver<Request>>>,
     responses: Arc<Mutex<Vec<Response>>>,
     socket: Arc<UdpSocket>,
     notify: Arc<Notify>,
@@ -57,8 +58,10 @@ impl RpcClient {
         let socket = Arc::new(UdpSocket::bind(local_addr).await?);
         socket.connect(remote_addr).await?;
         let (tx, _) = broadcast::channel(1);
+        let (_, rx) = mpsc::channel(32);
         Ok(Self {
             requests: Arc::new(Mutex::new(Vec::new())),
+            req: Arc::new(Mutex::new(rx)),
             responses: Arc::new(Mutex::new(Vec::new())),
             socket,
             notify: Arc::new(Notify::new()),
@@ -122,6 +125,9 @@ impl RpcClient {
         let notify = Arc::clone(&self.notify);
         let socket = Arc::clone(&self.socket);
         let requests = Arc::clone(&self.requests);
+        let req = Arc::clone(&self.req);
+        // This will be the only receiver for the mpsc channel, so it's safe to lock here
+        let mut req = req.lock().await;
         let exit = Arc::clone(&self.exit);
         let started = Arc::clone(&self.started);
         let mut rx = self.tx.as_ref().unwrap().subscribe();
@@ -136,33 +142,32 @@ impl RpcClient {
                         break;
                     }
                 }
-                _ = notify.notified() => {
-                    loop {
-                        let mut requests = requests.lock().await;
-                        if requests.len() == 0 {
-                            println!("Sender task, no pending request to send");
-                            break;
-                        }
-                        if requests[0].retries == 0 {
-                            println!("Request {:?} exceeded retry times", requests[0]);
-                            requests.remove(0);
-                            continue;
-                        };
-                        println!("Sender task is posting request {:?}", requests[0]);
-                        requests[0].retries -= 1;
-                        let bytes = bincode::serialize(&requests[0]).unwrap();
-                        send_data(&socket, &bytes).await.unwrap();
-                        drop(requests);
-                        match timeout(Duration::from_millis(100), notify.notified()).await {
-                            Ok(_) => {
-                                println!("Sender task got notification");
-                            },
-                            Err(_) => {
-                                println!("Sender task timed out waiting for notification, try resend request");
-                            },
+                requ = req.recv() => {
+                    if let Some(mut request) = requ {
+                        loop {
+                            if request.retries == 0 {
+                                println!("Request {:?} exceeded retry times", request);
+                                break;
+                            };
+                            println!("Sender task is posting request {:?}", request);
+                            request.retries -= 1;
+                            let bytes = bincode::serialize(&request).unwrap();
+                            send_data(&socket, &bytes).await.unwrap();
+                            // If this branch blocks here, it can not be executed by select again,
+                            // thus it can not send out next pending request, this is not
+                            // desirable. So we need a separate task to perform the retry logic.
+                            match timeout(Duration::from_millis(100), notify.notified()).await {
+                                Ok(_) => {
+                                    println!("Sender task got notification");
+                                },
+                                Err(_) => {
+                                    println!("Sender task timed out waiting for notification, try resend request");
+                                },
+                            }
                         }
                     }
                 }
+
             }
         }
         started.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -206,6 +211,7 @@ impl RpcClient {
         let requests = Arc::clone(&self.requests);
         let notify = Arc::clone(&self.notify);
         let mut requests = requests.lock().await;
+        let (tx, rx) = oneshot::channel::<Response>();
         println!("Posting request {:?}", request);
         requests.push(request);
         notify.notify_waiters();
